@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -168,17 +169,74 @@ func (a *Azure) Download(ctx context.Context, name string) (Download, error) {
 		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
 		Size:     size,
 		Metadata: resp.Metadata,
+		ETag:     etagString(resp.ETag),
 	}, nil
 }
 
-// DownloadRange opens count bytes of a blob from offset. Like Download, its
-// body resumes after a dropped connection.
-func (a *Azure) DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error) {
+// DownloadFirst opens a blob with a request for its first count bytes, whose
+// response also reports the blob's size, metadata and ETag. Azure refuses
+// any range of an empty blob, so an empty blob is opened with Download.
+func (a *Azure) DownloadFirst(ctx context.Context, name string, count int64) (Download, error) {
+	if count <= 0 {
+		// A zero HTTPRange asks for the whole blob.
+		return Download{}, fmt.Errorf("download range of %d bytes is invalid", count)
+	}
+	resp, err := a.blob(name).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Count: count}})
+	var responseErr *azcore.ResponseError
+	if errors.As(err, &responseErr) && responseErr.ErrorCode == string(bloberror.InvalidRange) {
+		return a.Download(ctx, name)
+	}
+	if err != nil {
+		return Download{}, mapError(err)
+	}
+	size, err := contentRangeSize(resp.ContentRange)
+	if err != nil {
+		resp.Body.Close()
+		return Download{}, err
+	}
+	return Download{
+		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
+		Size:     size,
+		Metadata: resp.Metadata,
+		ETag:     etagString(resp.ETag),
+	}, nil
+}
+
+// contentRangeSize returns the blob size, the part after the slash, of a
+// Content-Range header such as "bytes 0-99/1000".
+func contentRangeSize(header *string) (int64, error) {
+	if header == nil {
+		return 0, errors.New("ranged download response has no Content-Range")
+	}
+	_, total, _ := strings.Cut(*header, "/")
+	size, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || size < 0 {
+		return 0, fmt.Errorf("ranged download response has an invalid Content-Range %q", *header)
+	}
+	return size, nil
+}
+
+func etagString(etag *azcore.ETag) string {
+	if etag == nil {
+		return ""
+	}
+	return string(*etag)
+}
+
+// DownloadRange opens count bytes of a blob from offset, of the version etag
+// names if it is not empty. Like Download, its body resumes after a dropped
+// connection.
+func (a *Azure) DownloadRange(ctx context.Context, name string, offset, count int64, etag string) (io.ReadCloser, error) {
 	if count <= 0 {
 		// A zero HTTPRange asks for the whole blob.
 		return nil, fmt.Errorf("download range of %d bytes is invalid", count)
 	}
-	resp, err := a.blob(name).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: offset, Count: count}})
+	options := &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: offset, Count: count}}
+	if etag != "" {
+		match := azcore.ETag(etag)
+		options.AccessConditions = &blob.AccessConditions{ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: &match}}
+	}
+	resp, err := a.blob(name).DownloadStream(ctx, options)
 	if err != nil {
 		return nil, mapError(err)
 	}

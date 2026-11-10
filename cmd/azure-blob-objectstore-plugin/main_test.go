@@ -603,7 +603,11 @@ func (s *testStore) Download(context.Context, string) (blobstore.Download, error
 	return blobstore.Download{Body: io.NopCloser(strings.NewReader("")), Size: 0}, nil
 }
 
-func (s *testStore) DownloadRange(context.Context, string, int64, int64) (io.ReadCloser, error) {
+func (s *testStore) DownloadFirst(context.Context, string, int64) (blobstore.Download, error) {
+	return blobstore.Download{Body: io.NopCloser(strings.NewReader("")), Size: 0}, nil
+}
+
+func (s *testStore) DownloadRange(context.Context, string, int64, int64, string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
 

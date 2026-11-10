@@ -54,6 +54,9 @@ type Download struct {
 	// negative if it reported none.
 	Size     int64
 	Metadata map[string]*string
+	// ETag names the version of the blob the download read, or is empty if
+	// the service reported none.
+	ETag string
 }
 
 // Store is the block blob surface used by the snapshot provider.
@@ -64,9 +67,14 @@ type Store interface {
 	StageBlock(ctx context.Context, name, blockID string, body io.ReadSeeker, md5 []byte) error
 	CommitBlockList(ctx context.Context, name string, blockIDs []string, metadata map[string]*string) error
 	Download(ctx context.Context, name string) (Download, error)
+	// DownloadFirst opens a blob like Download, but its body may stop after
+	// the first count bytes; Size is still the whole blob's length, so the
+	// rest can be read with DownloadRange. count must be positive.
+	DownloadFirst(ctx context.Context, name string, count int64) (Download, error)
 	// DownloadRange opens count bytes of a blob, starting at offset. count
-	// must be positive.
-	DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error)
+	// must be positive. A non-empty etag fails the download with
+	// ErrUnavailable unless the blob is still that version.
+	DownloadRange(ctx context.Context, name string, offset, count int64, etag string) (io.ReadCloser, error)
 	List(ctx context.Context, prefix string) ([]string, error)
 	Delete(ctx context.Context, name string) error
 }

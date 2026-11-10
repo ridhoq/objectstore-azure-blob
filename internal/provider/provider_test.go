@@ -57,6 +57,14 @@ type fakeStore struct {
 	deleteErr   error
 	// readErr, when set, fails every download body after its first byte.
 	readErr error
+	// rangeCalls counts DownloadRange calls.
+	rangeCalls atomic.Int64
+}
+
+// etag names a version of a fake blob by its bytes.
+func (b fakeBlob) etag() string {
+	sum := md5.Sum(b.data)
+	return hex.EncodeToString(sum[:])
 }
 
 func newFakeStore() *fakeStore {
@@ -122,10 +130,26 @@ func (f *fakeStore) Download(ctx context.Context, name string) (blobstore.Downlo
 	if f.readErr != nil {
 		body = io.MultiReader(io.LimitReader(body, 1), &errReader{err: f.readErr})
 	}
-	return blobstore.Download{Body: io.NopCloser(body), Size: int64(len(blob.data)), Metadata: maps.Clone(blob.metadata)}, nil
+	return blobstore.Download{Body: io.NopCloser(body), Size: int64(len(blob.data)), Metadata: maps.Clone(blob.metadata), ETag: blob.etag()}, nil
 }
 
-func (f *fakeStore) DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error) {
+func (f *fakeStore) DownloadFirst(ctx context.Context, name string, count int64) (blobstore.Download, error) {
+	if count <= 0 {
+		return blobstore.Download{}, fmt.Errorf("download range of %d bytes is invalid", count)
+	}
+	download, err := f.Download(ctx, name)
+	if err != nil {
+		return blobstore.Download{}, err
+	}
+	download.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(download.Body, count), download.Body}
+	return download, nil
+}
+
+func (f *fakeStore) DownloadRange(ctx context.Context, name string, offset, count int64, etag string) (io.ReadCloser, error) {
+	f.rangeCalls.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -134,6 +158,9 @@ func (f *fakeStore) DownloadRange(ctx context.Context, name string, offset, coun
 	blob, ok := f.blobs[name]
 	if !ok {
 		return nil, blobstore.ErrNotFound
+	}
+	if etag != "" && etag != blob.etag() {
+		return nil, fmt.Errorf("%w: blob changed while it was read", blobstore.ErrUnavailable)
 	}
 	if count <= 0 || offset < 0 || offset > int64(len(blob.data)) {
 		return nil, fmt.Errorf("range %d+%d of a %d byte blob is invalid", offset, count, len(blob.data))
@@ -712,6 +739,109 @@ func TestStreamingReadErrorsKeepTheirCode(t *testing.T) {
 	if _, ok := store.blobs["tenant/tags/stable/manifest.json"]; ok {
 		t.Fatal("CopySnapshot committed a partially read blob")
 	}
+}
+
+// TestFetchSnapshotReadsRanges fetches a blob larger than one range as
+// ranges of the version its first request read, and a smaller one with that
+// request alone.
+func TestFetchSnapshotReadsRanges(t *testing.T) {
+	const rangeSize = 64
+	root := t.TempDir()
+	source, dest := filepath.Join(root, "source"), filepath.Join(root, "dest")
+	for _, dir := range []string{source, dest} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	large := patterned(1000)
+	files := map[string][]byte{"memory.img": large, "manifest.json": []byte("{}")}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(source, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := newFakeStore()
+	newServer := func(store blobstore.Store) *Server {
+		server, err := New(map[string]blobstore.Store{"snapshots": store}, "tenant", root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		server.fetch = newDownloadLimits(rangeSize, 3, 1<<20)
+		return server
+	}
+	server := newServer(fake)
+	ctx := context.Background()
+	if _, err := server.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{SnapshotUri: testURI, LocalPath: source, Files: []string{"memory.img", "manifest.json"}}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func(server *Server, name string) error {
+		_, err := server.FetchSnapshot(ctx, &objectstore.FetchSnapshotRequest{SnapshotUri: testURI, WritePath: dest, Files: []string{name}})
+		return err
+	}
+
+	if err := fetch(server, "manifest.json"); err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.rangeCalls.Load(); n != 0 {
+		t.Errorf("fetching a blob of at most one range made %d ranged requests, want none", n)
+	}
+	if err := fetch(server, "memory.img"); err != nil {
+		t.Fatal(err)
+	}
+	encoded := int64(denseHeaderSizeV1 + len(large))
+	if want := ceilDiv(encoded-rangeSize, rangeSize); fake.rangeCalls.Load() != want {
+		t.Errorf("fetching a %d byte blob made %d ranged requests, want %d", encoded, fake.rangeCalls.Load(), want)
+	}
+	for name, data := range files {
+		if got, err := os.ReadFile(filepath.Join(dest, name)); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("fetched %s differs (err %v)", name, err)
+		}
+	}
+
+	// A range that fails, or reads a blob replaced since the first
+	// request, fails the fetch as retryable and leaves the destination as
+	// it was.
+	blobName := "tenant/actors/a/snapshots/one/memory.img"
+	replacement := bytes.Repeat([]byte("new!"), 250)
+	replaced := sparseBlob(denseEncodingV1(replacement))
+	dropped := fmt.Errorf("%w: %w", blobstore.ErrUnavailable, io.EOF)
+	for name, store := range map[string]blobstore.Store{
+		"dropped":  droppingStore{fakeStore: fake, err: dropped},
+		"replaced": &replacingStore{fakeStore: fake, name: blobName, blob: replaced},
+	} {
+		if err := fetch(newServer(store), "memory.img"); status.Code(err) != codes.Unavailable {
+			t.Fatalf("%s fetch code = %v, want Unavailable: %v", name, status.Code(err), err)
+		}
+		if got, err := os.ReadFile(filepath.Join(dest, "memory.img")); err != nil || !bytes.Equal(got, large) {
+			t.Fatalf("%s fetch changed the destination (err %v)", name, err)
+		}
+	}
+	if entries, _ := os.ReadDir(dest); len(entries) != len(files) {
+		t.Fatalf("failed fetches left %v in the destination", entries)
+	}
+	if err := fetch(server, "memory.img"); err != nil {
+		t.Fatalf("retried fetch: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "memory.img")); !bytes.Equal(got, replacement) {
+		t.Fatal("retried fetch did not read the replacement blob")
+	}
+}
+
+// replacingStore replaces blob name with blob before its first ranged read.
+type replacingStore struct {
+	*fakeStore
+	name string
+	blob fakeBlob
+	once sync.Once
+}
+
+func (s *replacingStore) DownloadRange(ctx context.Context, name string, offset, count int64, etag string) (io.ReadCloser, error) {
+	s.once.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.blobs[s.name] = s.blob
+	})
+	return s.fakeStore.DownloadRange(ctx, name, offset, count, etag)
 }
 
 func TestCopySnapshotPartialRetry(t *testing.T) {

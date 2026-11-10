@@ -604,3 +604,119 @@ func TestAzuriteStreamsLargeBlocks(t *testing.T) {
 		t.Fatalf("StageBlock with a mismatched MD5 = %v, want ErrUnavailable", err)
 	}
 }
+
+// TestAzuriteRangedFetch fetches a blob as many ranges, checks that a range
+// pinned to the first request's ETag fails as retryable once the blob is
+// replaced, and that an empty blob, of which Azure refuses any range, fails
+// to decode as DataLoss rather than as a request error.
+func TestAzuriteRangedFetch(t *testing.T) {
+	endpoint := os.Getenv("AZURITE_BLOB_ENDPOINT")
+	account := os.Getenv("AZURITE_ACCOUNT_NAME")
+	key := os.Getenv("AZURITE_ACCOUNT_KEY")
+	if endpoint == "" || account == "" || key == "" {
+		t.Fatal("AZURITE_BLOB_ENDPOINT, AZURITE_ACCOUNT_NAME, and AZURITE_ACCOUNT_KEY are required")
+	}
+	credential, err := azblob.NewSharedKeyCredential(account, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceClient, err := service.NewClientWithSharedKeyCredential(endpoint, credential, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	containerName := fmt.Sprintf("ranged-%d", time.Now().UnixNano())
+	containerClient := serviceClient.NewContainerClient(containerName)
+	if _, err := containerClient.Create(context.Background(), nil); err != nil {
+		t.Fatalf("creating Azurite container %s: %v", containerName, err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = containerClient.Delete(ctx, nil)
+	})
+	azure, err := blobstore.NewAzureWithSharedKey(endpoint, containerName, account, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	server, err := New(map[string]blobstore.Store{containerName: azure}, "integration", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.fetch = newDownloadLimits(1<<20, 4, 8<<20)
+	ctx := context.Background()
+	source, dest := filepath.Join(root, "source"), filepath.Join(root, "dest")
+	for _, dir := range []string{source, dest} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "memory.img"), patterned(13<<20+123), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uri := "azblob://" + containerName + "/ranged"
+	if _, err := server.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{SnapshotUri: uri, LocalPath: source, Files: []string{"memory.img"}}); err != nil {
+		t.Fatalf("UploadSnapshot: %v", err)
+	}
+	if _, err := server.FetchSnapshot(ctx, &objectstore.FetchSnapshotRequest{SnapshotUri: uri, WritePath: dest, Files: []string{"memory.img"}}); err != nil {
+		t.Fatalf("FetchSnapshot: %v", err)
+	}
+	assertFileHash(t, filepath.Join(source, "memory.img"), filepath.Join(dest, "memory.img"))
+
+	commit := func(name string, data []byte) {
+		t.Helper()
+		var ids []string
+		if len(data) > 0 {
+			sum := md5.Sum(data)
+			id := base64.StdEncoding.EncodeToString([]byte("block"))
+			if err := azure.StageBlock(ctx, name, id, bytes.NewReader(data), sum[:]); err != nil {
+				t.Fatal(err)
+			}
+			ids = []string{id}
+		}
+		digest := sha256.Sum256(data)
+		hexDigest := hex.EncodeToString(digest[:])
+		format := sparseFormatV1
+		if err := azure.CommitBlockList(ctx, name, ids, map[string]*string{integrityMetadata: &hexDigest, formatMetadata: &format}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	commit("pinned", []byte("first version"))
+	first, err := azure.DownloadFirst(ctx, "pinned", 5)
+	if err != nil {
+		t.Fatalf("DownloadFirst: %v", err)
+	}
+	got, err := io.ReadAll(first.Body)
+	first.Body.Close()
+	if err != nil || string(got) != "first" || first.Size != int64(len("first version")) || first.ETag == "" {
+		t.Fatalf("DownloadFirst = %q (err %v) of %d bytes with ETag %q", got, err, first.Size, first.ETag)
+	}
+	rest, err := azure.DownloadRange(ctx, "pinned", 5, 8, first.ETag)
+	if err != nil {
+		t.Fatalf("DownloadRange of the current version: %v", err)
+	}
+	got, err = io.ReadAll(rest)
+	rest.Close()
+	if err != nil || string(got) != " version" {
+		t.Fatalf("DownloadRange = %q, %v, want %q", got, err, " version")
+	}
+	commit("pinned", []byte("other version"))
+	if _, err := azure.DownloadRange(ctx, "pinned", 5, 8, first.ETag); !errors.Is(err, blobstore.ErrUnavailable) {
+		t.Fatalf("DownloadRange of a replaced blob = %v, want ErrUnavailable", err)
+	}
+
+	commit("integration/empty/memory.img", nil)
+	empty, err := azure.DownloadFirst(ctx, "integration/empty/memory.img", 5)
+	if err != nil {
+		t.Fatalf("DownloadFirst of an empty blob: %v", err)
+	}
+	empty.Body.Close()
+	if empty.Size != 0 {
+		t.Fatalf("empty blob size = %d", empty.Size)
+	}
+	_, err = server.FetchSnapshot(ctx, &objectstore.FetchSnapshotRequest{SnapshotUri: "azblob://" + containerName + "/empty", WritePath: dest, Files: []string{"memory.img"}})
+	if status.Code(err) != codes.DataLoss {
+		t.Fatalf("FetchSnapshot of an empty blob code = %v, want DataLoss: %v", status.Code(err), err)
+	}
+}

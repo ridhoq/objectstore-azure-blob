@@ -123,13 +123,23 @@ func (m *memoryAzure) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeAzureError(w, http.StatusNotFound, "BlobNotFound")
 			return
 		}
+		sum := md5.Sum(data)
+		etag := fmt.Sprintf(`"0x%X"`, sum)
+		if match := r.Header.Get("If-Match"); match != "" && match != etag {
+			writeAzureError(w, http.StatusPreconditionFailed, "ConditionNotMet")
+			return
+		}
+		w.Header().Set("ETag", etag)
 		statusCode := http.StatusOK
 		if rng := r.Header.Get("x-ms-range"); rng != "" {
+			// Like Azure, serve the part of a range that the blob holds,
+			// and refuse one that starts past its end.
 			var first, last int
-			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &first, &last); err != nil || first > last || last >= len(data) {
+			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &first, &last); err != nil || first > last || first >= len(data) {
 				writeAzureError(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange")
 				return
 			}
+			last = min(last, len(data)-1)
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, len(data)))
 			data = data[first : last+1]
 			statusCode = http.StatusPartialContent
@@ -198,7 +208,7 @@ func TestAzureStore(t *testing.T) {
 	if value := download.Metadata["Substrate_sha256"]; value == nil || *value != digest {
 		t.Fatalf("metadata = %v, want digest %q", download.Metadata, digest)
 	}
-	ranged, err := store.DownloadRange(ctx, "prefix/file", 2, 4)
+	ranged, err := store.DownloadRange(ctx, "prefix/file", 2, 4, "")
 	if err != nil {
 		t.Fatalf("DownloadRange: %v", err)
 	}
@@ -212,7 +222,7 @@ func TestAzureStore(t *testing.T) {
 	if string(got) != "apsh" {
 		t.Fatalf("DownloadRange(2, 4) = %q, want %q", got, "apsh")
 	}
-	if _, err := store.DownloadRange(ctx, "prefix/file", 0, 0); err == nil {
+	if _, err := store.DownloadRange(ctx, "prefix/file", 0, 0, ""); err == nil {
 		t.Fatal("DownloadRange accepted an empty range, which Azure reads as the whole blob")
 	}
 	if err := store.StageBlock(ctx, "prefix/file", blockID, strings.NewReader("other"), sum[:]); !errors.Is(err, ErrUnavailable) {
@@ -234,6 +244,85 @@ func TestAzureStore(t *testing.T) {
 	if _, err := store.Download(ctx, "prefix/file"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing Download = %v, want ErrNotFound", err)
 	}
+}
+
+// TestAzureDownloadFirst checks that the first range's response reports the
+// whole blob's size and ETag, that a range pinned to that ETag fails as
+// retryable once the blob is replaced, and that an empty blob, of which Azure
+// refuses any range, still opens.
+func TestAzureDownloadFirst(t *testing.T) {
+	backend := newMemoryAzure()
+	server := httptest.NewServer(backend)
+	defer server.Close()
+	client, err := service.NewClientWithNoCredential(server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newAzure(client, "snapshots")
+	ctx := context.Background()
+	backend.blobs["file"] = []byte("snapshot")
+	backend.digests["file"] = "abc123"
+	backend.blobs["empty"] = []byte{}
+
+	for _, tc := range []struct {
+		name  string
+		count int64
+		want  string
+		size  int64
+	}{
+		{name: "file", count: 3, want: "sna", size: 8},
+		{name: "file", count: 100, want: "snapshot", size: 8},
+		{name: "empty", count: 3, want: "", size: 0},
+	} {
+		download, err := store.DownloadFirst(ctx, tc.name, tc.count)
+		if err != nil {
+			t.Fatalf("DownloadFirst(%s, %d): %v", tc.name, tc.count, err)
+		}
+		got, err := io.ReadAll(download.Body)
+		download.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want || download.Size != tc.size || download.ETag == "" {
+			t.Fatalf("DownloadFirst(%s, %d) = %q of %d bytes with ETag %q, want %q of %d bytes with an ETag", tc.name, tc.count, got, download.Size, download.ETag, tc.want, tc.size)
+		}
+	}
+	if value := mustDownloadFirst(t, store, "file").Metadata["Substrate_sha256"]; value == nil || *value != "abc123" {
+		t.Fatal("DownloadFirst did not return the blob's metadata")
+	}
+	if _, err := store.DownloadFirst(ctx, "file", 0); err == nil {
+		t.Fatal("DownloadFirst accepted an empty range, which Azure reads as the whole blob")
+	}
+	if _, err := store.DownloadFirst(ctx, "missing", 3); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DownloadFirst(missing) = %v, want ErrNotFound", err)
+	}
+
+	etag := mustDownloadFirst(t, store, "file").ETag
+	body, err := store.DownloadRange(ctx, "file", 3, 5, etag)
+	if err != nil {
+		t.Fatalf("DownloadRange of the current version: %v", err)
+	}
+	got, err := io.ReadAll(body)
+	body.Close()
+	if err != nil || string(got) != "pshot" {
+		t.Fatalf("DownloadRange(3, 5) = %q, %v, want %q", got, err, "pshot")
+	}
+	backend.mu.Lock()
+	backend.blobs["file"] = []byte("replaced")
+	backend.mu.Unlock()
+	if _, err := store.DownloadRange(ctx, "file", 3, 5, etag); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("DownloadRange of a replaced blob = %v, want ErrUnavailable", err)
+	}
+}
+
+func mustDownloadFirst(t *testing.T, store *Azure, name string) Download {
+	t.Helper()
+	download, err := store.DownloadFirst(context.Background(), name, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	download.Body.Close()
+	return download
 }
 
 func TestConstructorsRejectInvalidConfiguration(t *testing.T) {

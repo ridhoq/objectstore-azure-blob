@@ -263,10 +263,13 @@ func (*foreignEndpointError) NonRetriable() {}
 
 // defaultTransport carries over the connection pool, TLS, and HTTP/2 health
 // check settings of the Azure SDK's default HTTP transport, which a custom
-// policy.Transporter replaces.
+// policy.Transporter replaces. It keeps more idle connections than the SDK's
+// 10: a fetch reads a blob as up to eight ranges at once, and every request
+// to the account goes to one host, so concurrent fetches and uploads would
+// otherwise open and close connections to it on every range.
 func defaultTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConnsPerHost = 10
+	transport.MaxIdleConnsPerHost = 32
 	transport.TLSClientConfig = &tls.Config{
 		MinVersion:    tls.VersionTLS12,
 		Renegotiation: tls.RenegotiateFreelyAsClient,

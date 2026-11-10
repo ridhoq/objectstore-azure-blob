@@ -115,6 +115,7 @@ type Server struct {
 	prefix string
 	root   string
 	limits blockLimits
+	fetch  downloadLimits
 }
 
 // New returns a snapshot provider confined to root, prefix, and the
@@ -138,7 +139,13 @@ func New(stores map[string]blobstore.Store, prefix, root string) (*Server, error
 	if prefix != "" && !validKey(prefix) {
 		return nil, fmt.Errorf("prefix %q is invalid", prefix)
 	}
-	return &Server{stores: maps.Clone(stores), prefix: prefix, root: filepath.Clean(root), limits: azureLimits}, nil
+	return &Server{
+		stores: maps.Clone(stores),
+		prefix: prefix,
+		root:   filepath.Clean(root),
+		limits: azureLimits,
+		fetch:  newDownloadLimits(downloadRangeSize, downloadRangesAhead, downloadBufferBudget),
+	}, nil
 }
 
 // FetchSnapshot downloads, decodes and verifies every requested file before
@@ -155,7 +162,7 @@ func (s *Server) FetchSnapshot(ctx context.Context, req *objectstore.FetchSnapsh
 	defer root.Close()
 
 	for _, name := range req.GetFiles() {
-		if err := fetchFile(ctx, loc.store, root, path.Join(loc.prefix, name), name); err != nil {
+		if err := s.fetch.fetchFile(ctx, loc.store, root, path.Join(loc.prefix, name), name); err != nil {
 			return nil, toStatus(err)
 		}
 	}
@@ -287,8 +294,10 @@ func (s *Server) CopySnapshot(ctx context.Context, req *objectstore.CopySnapshot
 	return &objectstore.CopySnapshotResponse{}, nil
 }
 
-func fetchFile(ctx context.Context, store blobstore.Store, root *os.Root, blobName, fileName string) error {
-	download, err := store.Download(ctx, blobName)
+// fetchFile downloads blobName in ranges (see download), decodes it into a
+// temporary file and renames that to fileName once the blob's SHA-256 matches.
+func (d downloadLimits) fetchFile(ctx context.Context, store blobstore.Store, root *os.Root, blobName, fileName string) error {
+	download, err := d.download(ctx, store, blobName)
 	if err != nil {
 		return err
 	}
@@ -575,7 +584,7 @@ func (r *rangeBody) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if r.body == nil {
-		body, err := r.store.DownloadRange(r.ctx, r.name, r.off+r.pos, r.n-r.pos)
+		body, err := r.store.DownloadRange(r.ctx, r.name, r.off+r.pos, r.n-r.pos, "")
 		if err != nil {
 			return 0, err
 		}

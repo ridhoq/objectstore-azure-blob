@@ -511,7 +511,11 @@ func (s *streamStore) Download(_ context.Context, name string) (blobstore.Downlo
 	}, nil
 }
 
-func (s *streamStore) DownloadRange(_ context.Context, name string, offset, count int64) (io.ReadCloser, error) {
+func (s *streamStore) DownloadFirst(ctx context.Context, name string, _ int64) (blobstore.Download, error) {
+	return s.Download(ctx, name)
+}
+
+func (s *streamStore) DownloadRange(_ context.Context, name string, offset, count int64, _ string) (io.ReadCloser, error) {
 	s.rangeReads.Add(1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -751,8 +755,8 @@ type droppingStore struct {
 	err error
 }
 
-func (s droppingStore) DownloadRange(ctx context.Context, name string, offset, count int64) (io.ReadCloser, error) {
-	body, err := s.fakeStore.DownloadRange(ctx, name, offset, count)
+func (s droppingStore) DownloadRange(ctx context.Context, name string, offset, count int64, etag string) (io.ReadCloser, error) {
+	body, err := s.fakeStore.DownloadRange(ctx, name, offset, count, etag)
 	if err != nil {
 		return nil, err
 	}

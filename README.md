@@ -30,7 +30,13 @@ whole file as one frame. `FetchSnapshot` writes each frame as it reads it into
 a new temporary file of the logical size, so every byte outside the frames
 reads as zero without being allocated, and renames the file into place once
 its digest matches. A restore holds one frame's position at a time, however
-many frames a blob claims. The blob's `substrate_format` metadata is
+many frames a blob claims. A fetch reads a blob larger than 16 MiB as 16 MiB
+ranges, up to eight at once, and hands them to the decoder in order. The first
+request also reports the blob's size and version (ETag), and every later range
+must match that ETag. A blob of up to 16 MiB takes one request. This follows
+substrate's in-tree object storage
+([`pkg/objectstorage/rangedget.go`](https://github.com/agent-substrate/substrate/blob/v1.0.0/pkg/objectstorage/rangedget.go)).
+The blob's `substrate_format` metadata is
 `sparse-v1`; a fetch refuses a blob without it or with a format it does not
 know. `CopySnapshot` copies the blob and its format and digest metadata without
 decoding it, and refuses a blob without format metadata.
@@ -329,7 +335,7 @@ Without the gate, ate-api-server ignores that field. See
 | Unknown storage account host name | `Internal` |
 | Microsoft Entra token request throttled, timed out, failed with a server error, or got no response | `Unavailable` |
 | Microsoft Entra rejects the token request | `Internal` |
-| Blob replaced while a download was resuming | `Unavailable` |
+| Blob replaced while a fetch read its ranges or a download was resuming | `Unavailable` |
 | Context canceled or deadline exceeded | `Canceled` / `DeadlineExceeded` |
 | SHA-256 metadata absent, invalid, or mismatched | `DataLoss` |
 | Fetched blob without known format metadata, or malformed; copied blob without format metadata | `DataLoss` |
@@ -377,9 +383,13 @@ for `gs://` URLs, which this plugin never reads.
   32 MiB at once, when blocks are up to 32 MiB (blobs up to about 1.5 TiB).
   Larger blocks are staged from a second, ranged download of the source, like
   file blocks, so a copy holds no more than 32 MiB of block data at any size.
-- These bounds are per RPC, not process-wide, so concurrent uploads and copies
-  multiply the memory use, and each block in flight also holds the HTTP
-  client's buffers.
+- `FetchSnapshot` holds up to eight 16 MiB ranges of a blob ahead of its
+  decoder, at most 128 MiB per fetch. All fetches in the process share 256 MiB
+  of range buffers, so concurrent fetches together hold at most that much and
+  wait for each other's buffers beyond it.
+- The upload and copy bounds are per RPC, not process-wide, so concurrent
+  uploads and copies multiply the memory use, and each block or range in
+  flight also holds the HTTP client's buffers.
 - One plugin process is confined to one storage account and the containers in
   `--containers`. Copying snapshots across accounts is not supported.
 
