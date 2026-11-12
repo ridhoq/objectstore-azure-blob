@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -75,8 +76,8 @@ func TestRangedReaderReadsInOrder(t *testing.T) {
 				}
 				// The head covers the first range, so a blob of up to one
 				// range is a single request.
-				if want := max(0, (size-1)/rangeSize); f.calls.Load() != int64(want) {
-					t.Errorf("fetched %d ranges, want %d", f.calls.Load(), want)
+				if want := max(0, (size-1)/rangeSize); f.calls.Load() != int64(want) || r.fetchStats().ranges != want {
+					t.Errorf("fetched %d ranges and counted %d, want %d", f.calls.Load(), r.fetchStats().ranges, want)
 				}
 				if n := buffersInUse(f.limits); n != 0 {
 					t.Errorf("%d buffers still taken after Close", n)
@@ -126,6 +127,40 @@ func TestRangedReaderBoundsBuffers(t *testing.T) {
 			t.Fatal("concurrent fetches read the wrong bytes")
 		}
 	})
+}
+
+// TestRangeBuffersAreKept checks that buffers survive garbage collection, so
+// fetches reuse them instead of allocating new ones that the old ones then
+// sit beside as garbage.
+func TestRangeBuffersAreKept(t *testing.T) {
+	const size = 8 << 20
+	buffers := newRangeBuffers(size, 2)
+	ctx := context.Background()
+	for range 2 {
+		a, err := buffers.get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := buffers.get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buffers.put(a)
+		buffers.put(b)
+		runtime.GC()
+		runtime.GC()
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	buf, err := buffers.get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	buffers.put(buf)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= size {
+		t.Fatalf("get after garbage collection allocated %d bytes, want a kept buffer", allocated)
+	}
 }
 
 func TestRangedReaderFailures(t *testing.T) {

@@ -18,9 +18,11 @@ import (
 	"errors"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"plugins.go.ate.dev/objectstore-azure-blob/internal/blobstore"
 	"sigs.k8s.io/yaml"
 )
@@ -200,6 +202,9 @@ type container struct {
 		Name      string `json:"name"`
 		MountPath string `json:"mountPath"`
 	} `json:"volumeMounts"`
+	Resources struct {
+		Requests map[string]string `json:"requests"`
+	} `json:"resources"`
 }
 
 // assertSidecarPatch checks that a patch replaces only the base
@@ -267,11 +272,12 @@ func assertSidecarPatch(t *testing.T, raw, mode string) {
 	if sidecar.StartupProbe == nil || sidecar.StartupProbe.Exec == nil || !slices.Equal(sidecar.StartupProbe.Exec.Command, wantProbe) {
 		t.Errorf("%s sidecar startup probe does not run %v", mode, wantProbe)
 	}
-	assertEnvNames(t, sidecar, []string{
-		"AZURE_CLIENT_ID",
-		"AZURE_TENANT_ID",
-		"AZURE_FEDERATED_TOKEN_FILE",
-	}, []string{"ATE_STORAGE_BACKEND"})
+	wantEnv := []string{"AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_FEDERATED_TOKEN_FILE"}
+	if mode == "node" {
+		wantEnv = append(wantEnv, "GOMEMLIMIT")
+		assertMemoryLimitFitsRequest(t, sidecar)
+	}
+	assertEnvNames(t, sidecar, wantEnv, []string{"ATE_STORAGE_BACKEND"})
 	assertMounts(t, sidecar, map[string]string{"azure-identity-token": "/var/run/secrets/azure/tokens"})
 
 	var foundToken bool
@@ -290,6 +296,31 @@ func assertSidecarPatch(t *testing.T, raw, mode string) {
 	}
 	if !foundToken {
 		t.Errorf("%s patch has no Azure federated service-account token projection", mode)
+	}
+}
+
+// assertMemoryLimitFitsRequest checks that the node sidecar's GOMEMLIMIT
+// parses and is below the memory it requests, so the runtime collects garbage
+// before the plugin uses more than the node reserved for it.
+func assertMemoryLimitFitsRequest(t *testing.T, sidecar container) {
+	t.Helper()
+	var limit string
+	for _, env := range sidecar.Env {
+		if env.Name == "GOMEMLIMIT" {
+			limit = env.Value
+		}
+	}
+	mib, ok := strings.CutSuffix(limit, "MiB")
+	limitMiB, err := strconv.ParseInt(mib, 10, 64)
+	if !ok || err != nil {
+		t.Fatalf("node sidecar GOMEMLIMIT %q is not a whole number of MiB", limit)
+	}
+	request, err := resource.ParseQuantity(sidecar.Resources.Requests["memory"])
+	if err != nil {
+		t.Fatalf("node sidecar memory request: %v", err)
+	}
+	if limitMiB<<20 >= request.Value() {
+		t.Errorf("node sidecar GOMEMLIMIT %s is not below its %s memory request", limit, request.String())
 	}
 }
 

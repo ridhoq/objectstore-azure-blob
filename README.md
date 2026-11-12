@@ -82,7 +82,10 @@ environment and projected token, and points their startup probes at
 socket volume as the base defines them. The base control sidecar's credential
 exchange settings also stay: the `exchange` port, `ATE_API_ACTOR_JWT_ISSUER`,
 `POD_NAMESPACE`, and the `servicedns`, `podidentity` and `actor-id-jwt-jwks`
-mounts; this plugin serves no exchange and reads none of them. The
+mounts; this plugin serves no exchange and reads none of them. On the node
+sidecar it also sets `GOMEMLIMIT=384MiB` and requests 448 MiB of memory, room
+for the 256 MiB of download buffers that fetches share (see
+[Limitations](#limitations-and-open-edges)); it sets no memory limit. The
 `ATE_API_SNAPSHOT_TRANSFER_SERVICE_ACCOUNT` variable still comes from the
 ConfigMap key ate-setup writes, so a hand-written ConfigMap must still carry
 that key for the pod to start. On the kind overlay, the `AWS_*` variables its
@@ -320,6 +323,27 @@ ate-api-server stores snapshots under `--snapshot-location`, which must be an
 Without the gate, ate-api-server ignores that field. See
 [Snapshot storage](https://github.com/agent-substrate/substrate/blob/main/docs/operator-install.md#snapshot-storage).
 
+## Logs
+
+The plugin logs to stderr in `key=value` form: each RPC as it starts and ends,
+with its method, duration and error. A log line written while serving an RPC
+carries the caller's `trace_id` and `parent_span_id` from the W3C
+`traceparent` that atelet and ate-api-server send, so it can be joined to the
+caller's own logs. It also logs:
+
+- each attempt of an Azure Blob request that took a second or more, failed,
+  was retried, or got a throttling, timeout, server error or `If-Match`
+  failure. The line has the method, the container and blob path, the range,
+  the HTTP status, Azure's `x-ms-request-id`, and the
+  `x-ms-client-request-id` and attempt number its retries share. It also
+  splits the time into waiting for a connection, DNS, connect, TLS, first byte
+  and reading the body, and says whether the connection was reused.
+- each failed read of a download body, which the SDK resumes with a new
+  request.
+- each snapshot file whose fetch took a second or more or failed, with the
+  blob's size, how many ranges it read, how long it waited for buffers other
+  fetches held, and its slowest range.
+
 ## Error behavior
 
 | Condition | gRPC code |
@@ -386,7 +410,11 @@ for `gs://` URLs, which this plugin never reads.
 - `FetchSnapshot` holds up to eight 16 MiB ranges of a blob ahead of its
   decoder, at most 128 MiB per fetch. All fetches in the process share 256 MiB
   of range buffers, so concurrent fetches together hold at most that much and
-  wait for each other's buffers beyond it.
+  wait for each other's buffers beyond it. The buffers are allocated as fetches
+  first need them and kept for reuse, so once concurrent fetches have needed
+  all 256 MiB the plugin holds them until it exits. Without `GOMEMLIMIT`, the Go
+  runtime lets garbage grow to about the size of the memory in use before
+  collecting it, so the process can reach twice the buffers it holds.
 - The upload and copy bounds are per RPC, not process-wide, so concurrent
   uploads and copies multiply the memory use, and each block or range in
   flight also holds the HTTP client's buffers.

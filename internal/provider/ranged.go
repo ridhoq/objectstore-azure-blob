@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"plugins.go.ate.dev/objectstore-azure-blob/internal/blobstore"
 )
@@ -64,34 +65,38 @@ func newDownloadLimits(rangeSize int64, ahead int, budget int64) downloadLimits 
 }
 
 // rangeBuffers are buffers of one range each, at most count of them in use at
-// once. A buffer is reused while it is warm and freed by the garbage
-// collector once it is not.
+// once. A buffer is allocated the first time it is needed and then kept and
+// reused, so the buffers in the process never exceed count.
 type rangeBuffers struct {
+	size  int64
 	slots chan struct{}
-	pool  sync.Pool
+	free  chan *[]byte
 }
 
 func newRangeBuffers(size int64, count int) *rangeBuffers {
-	b := &rangeBuffers{slots: make(chan struct{}, count)}
-	b.pool.New = func() any {
-		buf := make([]byte, size)
-		return &buf
-	}
-	return b
+	return &rangeBuffers{size: size, slots: make(chan struct{}, count), free: make(chan *[]byte, count)}
 }
 
 // get waits for a free buffer.
 func (b *rangeBuffers) get(ctx context.Context) (*[]byte, error) {
 	select {
 	case b.slots <- struct{}{}:
-		return b.pool.Get().(*[]byte), nil
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	}
+	select {
+	case buf := <-b.free:
+		return buf, nil
+	default:
+		buf := make([]byte, b.size)
+		return &buf, nil
+	}
 }
 
+// put returns a buffer from get. The free list holds a buffer for every slot,
+// so it never blocks.
 func (b *rangeBuffers) put(buf *[]byte) {
-	b.pool.Put(buf)
+	b.free <- buf
 	<-b.slots
 }
 
@@ -140,10 +145,23 @@ type rangedReader struct {
 	// once it has started every range or stopped.
 	ranges  chan *fetchedRange
 	workers sync.WaitGroup
+	stats   fetchStats
+	statsMu sync.Mutex
 
 	cur    *fetchedRange
 	err    error
 	closed bool
+}
+
+// fetchStats describes how a rangedReader read its blob.
+type fetchStats struct {
+	// ranges is how many ranges it requested after the first.
+	ranges int
+	// bufferWait is how long it waited for buffers that other fetches held.
+	bufferWait time.Duration
+	// slowestRange is the longest any one range took, from its request to
+	// its last byte.
+	slowestRange time.Duration
 }
 
 // fetchedRange is one range of the blob. data and err are set when done is
@@ -189,7 +207,11 @@ func (r *rangedReader) schedule(fetch rangeFetcher, start, size, rangeSize int64
 		case <-r.ctx.Done():
 			return
 		}
+		waitStart := time.Now()
 		buf, err := r.buffers.get(r.ctx)
+		r.statsMu.Lock()
+		r.stats.bufferWait += time.Since(waitStart)
+		r.statsMu.Unlock()
 		if err != nil {
 			<-r.ahead
 			return
@@ -200,7 +222,13 @@ func (r *rangedReader) schedule(fetch rangeFetcher, start, size, rangeSize int64
 		go func(off int64) {
 			defer r.workers.Done()
 			defer close(fr.done)
-			if err := r.fetchRange(fetch, off, fr.data); err != nil {
+			start := time.Now()
+			err := r.fetchRange(fetch, off, fr.data)
+			r.statsMu.Lock()
+			r.stats.ranges++
+			r.stats.slowestRange = max(r.stats.slowestRange, time.Since(start))
+			r.statsMu.Unlock()
+			if err != nil {
 				fr.err = err
 				r.cancel(err)
 			}
@@ -293,6 +321,13 @@ func (r *rangedReader) Read(p []byte) (int, error) {
 func (r *rangedReader) release(fr *fetchedRange) {
 	r.buffers.put(fr.buf)
 	<-r.ahead
+}
+
+// fetchStats returns how the reader read its blob so far.
+func (r *rangedReader) fetchStats() fetchStats {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+	return r.stats
 }
 
 // Close stops the fetch and waits for its ranges, returning their buffers.

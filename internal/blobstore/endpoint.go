@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -56,6 +57,8 @@ type endpointTransport struct {
 	host         string
 	client       *http.Client
 	stallTimeout time.Duration
+	// slowRequest is how long an attempt may take before it is logged.
+	slowRequest time.Duration
 }
 
 func newEndpointTransport(endpoint *url.URL, base http.RoundTripper, stallTimeout time.Duration) *endpointTransport {
@@ -69,6 +72,7 @@ func newEndpointTransport(endpoint *url.URL, base http.RoundTripper, stallTimeou
 			},
 		},
 		stallTimeout: stallTimeout,
+		slowRequest:  defaultSlowRequest,
 	}
 }
 
@@ -77,7 +81,8 @@ func (t *endpointTransport) Do(req *http.Request) (*http.Response, error) {
 	if !strings.EqualFold(req.URL.Scheme, t.scheme) || !strings.EqualFold(req.URL.Host, t.host) {
 		return nil, &foreignEndpointError{scheme: req.URL.Scheme, host: req.URL.Host, want: t.scheme + "://" + t.host}
 	}
-	ctx, cancel := context.WithCancel(req.Context())
+	log := newAttemptLog(req, t.slowRequest)
+	ctx, cancel := context.WithCancel(httptrace.WithClientTrace(req.Context(), log.trace()))
 	watch := newStallWatch(t.stallTimeout, cancel)
 	fence := &bodyFence{}
 	defer fence.close()
@@ -101,11 +106,13 @@ func (t *endpointTransport) Do(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		cancel()
 		if watch.isStalled() {
-			return nil, &stallError{timeout: t.stallTimeout}
+			err = &stallError{timeout: t.stallTimeout}
 		}
+		log.end(err)
 		return nil, err
 	}
-	resp.Body = &responseBody{body: resp.Body, watch: watch}
+	log.responded(resp)
+	resp.Body = &loggedBody{ReadCloser: &responseBody{body: resp.Body, watch: watch}, log: log}
 	return resp, nil
 }
 

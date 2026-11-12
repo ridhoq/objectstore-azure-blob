@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"plugins.go.ate.dev/objectstore-azure-blob/internal/blobstore"
 )
@@ -512,6 +513,50 @@ func (h recordHandler) Handle(_ context.Context, r slog.Record) error {
 }
 func (h recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h recordHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestLogRPCTagsCallerTrace checks that the plugin's log lines for an RPC
+// carry the trace ID its caller sent, and that a missing or malformed
+// traceparent adds nothing.
+func TestLogRPCTagsCallerTrace(t *testing.T) {
+	const traceID, spanID = "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"
+	for name, tc := range map[string]struct {
+		traceparent string
+		want        bool
+	}{
+		"valid":     {"00-" + traceID + "-" + spanID + "-01", true},
+		"none":      {"", false},
+		"malformed": {"00-not-a-trace-01", false},
+		"zero":      {"00-" + strings.Repeat("0", 32) + "-" + spanID + "-01", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var records []slog.Record
+			orig := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(orig) })
+			slog.SetDefault(slog.New(traceHandler{recordHandler{&records}}))
+			ctx := t.Context()
+			if tc.traceparent != "" {
+				ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("traceparent", tc.traceparent))
+			}
+			_, _ = logRPC(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/test"}, func(ctx context.Context, _ any) (any, error) {
+				slog.InfoContext(ctx, "inside handler")
+				return nil, nil
+			})
+			if len(records) != 3 {
+				t.Fatalf("logged %d records, want 3", len(records))
+			}
+			for _, r := range records {
+				got := map[string]string{}
+				r.Attrs(func(a slog.Attr) bool { got[a.Key] = a.Value.String(); return true })
+				if tc.want && (got["trace_id"] != traceID || got["parent_span_id"] != spanID) {
+					t.Errorf("%q has trace_id %q and parent_span_id %q, want %q and %q", r.Message, got["trace_id"], got["parent_span_id"], traceID, spanID)
+				}
+				if _, ok := got["trace_id"]; !tc.want && ok {
+					t.Errorf("%q has trace_id %q, want none", r.Message, got["trace_id"])
+				}
+			}
+		})
+	}
+}
 
 func TestRunReturnsListenError(t *testing.T) {
 	parent := filepath.Join(t.TempDir(), "file")

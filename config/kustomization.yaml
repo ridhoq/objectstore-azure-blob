@@ -110,9 +110,21 @@ patches:
                 - /ko-app/azure-blob-objectstore-plugin
                 - healthcheck
                 - --socket=/run/objectstore-plugin/node.sock
+            # A fetch holds up to 128 MiB of download buffers, and all
+            # fetches share at most 256 MiB. GOMEMLIMIT makes the Go runtime
+            # collect garbage before the heap passes 384 MiB, instead of
+            # letting it grow to twice the buffers in use. The request
+            # reserves that much; there is no limit, so a node short of
+            # memory slows the plugin's garbage collection instead of
+            # killing a restore.
+            resources:
+              requests:
+                memory: 448Mi
             env:
             - name: ATE_STORAGE_BACKEND
               $patch: delete
+            - name: GOMEMLIMIT
+              value: 384MiB
             - name: AZURE_CLIENT_ID
               value: REPLACE_WITH_NODE_CLIENT_ID
             - name: AZURE_TENANT_ID

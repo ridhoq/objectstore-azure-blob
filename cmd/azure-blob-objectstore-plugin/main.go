@@ -42,6 +42,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"plugins.go.ate.dev/objectstore-azure-blob/internal/blobstore"
@@ -49,6 +50,7 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(traceHandler{slog.NewTextHandler(os.Stderr, nil)}))
 	if err := run(context.Background(), os.Args[1:], newAzureStores); err != nil {
 		slog.Error("azure-blob-objectstore-plugin exited", slog.Any("err", err))
 		os.Exit(1)
@@ -277,6 +279,7 @@ func runHealthcheck(ctx context.Context, args []string) error {
 }
 
 func logRPC(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	ctx = withCallerTrace(ctx)
 	start := time.Now()
 	slog.InfoContext(ctx, "handling RPC", slog.String("method", info.FullMethod))
 	resp, err := handler(ctx, req)
@@ -295,6 +298,52 @@ func logRPC(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler gr
 		slog.Duration("duration", time.Since(start)),
 		slog.Any("err", err))
 	return resp, err
+}
+
+type callerTraceKey struct{}
+
+// callerTrace is the W3C trace context the caller sent with an RPC.
+type callerTrace struct{ traceID, spanID string }
+
+// withCallerTrace returns ctx with the trace context of the RPC's caller.
+// atelet and ate-api-server send theirs as a W3C traceparent, so the plugin's
+// logs for an RPC can be joined to the caller's logs and traces by trace_id.
+func withCallerTrace(ctx context.Context) context.Context {
+	md, _ := metadata.FromIncomingContext(ctx)
+	values := md.Get("traceparent")
+	if len(values) == 0 {
+		return ctx
+	}
+	// version-traceid-parentid-flags, as in 00-<32 hex>-<16 hex>-<2 hex>.
+	parts := strings.Split(values[0], "-")
+	if len(parts) < 4 || len(parts[1]) != 32 || len(parts[2]) != 16 || !isHex(parts[1]) || !isHex(parts[2]) ||
+		strings.Trim(parts[1], "0") == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, callerTraceKey{}, callerTrace{traceID: parts[1], spanID: parts[2]})
+}
+
+func isHex(s string) bool {
+	return strings.Trim(strings.ToLower(s), "0123456789abcdef") == ""
+}
+
+// traceHandler adds the caller's trace_id and span_id, if the context holds
+// them, to each record.
+type traceHandler struct{ slog.Handler }
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if trace, ok := ctx.Value(callerTraceKey{}).(callerTrace); ok {
+		r.AddAttrs(slog.String("trace_id", trace.traceID), slog.String("parent_span_id", trace.spanID))
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{h.Handler.WithGroup(name)}
 }
 
 func listen(socket string) (net.Listener, error) {

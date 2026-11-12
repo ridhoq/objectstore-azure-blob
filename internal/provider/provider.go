@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"maps"
 	"net/url"
 	"os"
@@ -35,6 +36,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"go.ate.dev/substrate/api/objectstore/v1"
 	"google.golang.org/grpc/codes"
@@ -296,12 +298,16 @@ func (s *Server) CopySnapshot(ctx context.Context, req *objectstore.CopySnapshot
 
 // fetchFile downloads blobName in ranges (see download), decodes it into a
 // temporary file and renames that to fileName once the blob's SHA-256 matches.
-func (d downloadLimits) fetchFile(ctx context.Context, store blobstore.Store, root *os.Root, blobName, fileName string) error {
+func (d downloadLimits) fetchFile(ctx context.Context, store blobstore.Store, root *os.Root, blobName, fileName string) (err error) {
+	start := time.Now()
 	download, err := d.download(ctx, store, blobName)
 	if err != nil {
 		return err
 	}
-	defer download.Body.Close()
+	defer func() {
+		_ = download.Body.Close()
+		logFetch(ctx, blobName, download, time.Since(start), err)
+	}()
 	decode, err := decoderFor(download.Metadata)
 	if err != nil {
 		return err
@@ -338,6 +344,36 @@ func (d downloadLimits) fetchFile(ctx context.Context, store blobstore.Store, ro
 		return fmt.Errorf("replacing restore file: %w", err)
 	}
 	return syncDirs(root, parent)
+}
+
+// slowFetchThreshold is how long a file's fetch may take before it is logged.
+const slowFetchThreshold = time.Second
+
+// logFetch logs a file's fetch that failed or took longer than
+// slowFetchThreshold, with how its ranges were read, so a slow restore can be
+// traced to the requests the store logs for the same RPC.
+func logFetch(ctx context.Context, blobName string, download blobstore.Download, took time.Duration, err error) {
+	if err == nil && took < slowFetchThreshold {
+		return
+	}
+	attrs := []slog.Attr{
+		slog.String("blob", blobName),
+		slog.Int64("bytes", download.Size),
+		slog.Duration("duration", took),
+		slog.Any("err", err),
+	}
+	if r, ok := download.Body.(*rangedReader); ok {
+		stats := r.fetchStats()
+		attrs = append(attrs,
+			slog.Int("ranges", stats.ranges),
+			slog.Duration("bufferWait", stats.bufferWait),
+			slog.Duration("slowestRange", stats.slowestRange))
+	}
+	level := slog.LevelInfo
+	if err != nil {
+		level = slog.LevelWarn
+	}
+	slog.LogAttrs(ctx, level, "Slow or failed snapshot file fetch", attrs...)
 }
 
 // syncDirs syncs dir and each of its ancestors up to the root, so a renamed

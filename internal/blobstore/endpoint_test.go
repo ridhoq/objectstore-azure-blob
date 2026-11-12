@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 )
 
 const testToken = "test-storage-token"
@@ -408,3 +410,100 @@ func TestRequestBodyReadsFailAfterReturn(t *testing.T) {
 		t.Fatalf("the late read consumed %d bytes of the body", len("block data")-body.Len())
 	}
 }
+
+// TestRequestLog checks which storage request attempts are logged: slow
+// ones, failed ones and retries, each with the call's client request ID and
+// its attempt number, but not fast answers such as a missing blob.
+func TestRequestLog(t *testing.T) {
+	var flakyCalls atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-ms-request-id", "server-"+strings.TrimPrefix(r.URL.Path, "/snapshots/"))
+		switch r.URL.Path {
+		case "/snapshots/missing":
+			writeAzureError(w, http.StatusNotFound, "BlobNotFound")
+			return
+		case "/snapshots/flaky":
+			if flakyCalls.Add(1) == 1 {
+				writeAzureError(w, http.StatusServiceUnavailable, "ServerBusy")
+				return
+			}
+		case "/snapshots/slow":
+			time.Sleep(100 * time.Millisecond)
+		}
+		w.Header().Set("Content-Length", "4")
+		_, _ = w.Write([]byte("data"))
+	}))
+	defer server.Close()
+	opts := clientOptions(mustParseURL(t, server.URL), server.Client().Transport, policy.RetryOptions{RetryDelay: time.Millisecond}, defaultStallTimeout)
+	opts.Transport.(*endpointTransport).slowRequest = 50 * time.Millisecond
+	client, err := service.NewClient(server.URL, staticCredential{}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newAzure(client, "snapshots")
+
+	var mu sync.Mutex
+	var records []map[string]slog.Value
+	orig := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	slog.SetDefault(slog.New(funcHandler(func(r slog.Record) {
+		attrs := map[string]slog.Value{"level": slog.StringValue(r.Level.String())}
+		r.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value; return true })
+		mu.Lock()
+		records = append(records, attrs)
+		mu.Unlock()
+	})))
+	logged := func(name string) []map[string]slog.Value {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []map[string]slog.Value
+		for _, r := range records {
+			if r["path"].String() == "/snapshots/"+name {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	for _, name := range []string{"fast", "slow", "flaky"} {
+		download, err := store.Download(t.Context(), name)
+		if err != nil {
+			t.Fatalf("Download(%s): %v", name, err)
+		}
+		if _, err := io.ReadAll(download.Body); err != nil {
+			t.Fatal(err)
+		}
+		download.Body.Close()
+	}
+	if _, err := store.Download(t.Context(), "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Download(missing) = %v, want ErrNotFound", err)
+	}
+
+	if got := logged("fast"); len(got) != 0 {
+		t.Errorf("fast request logged: %v", got)
+	}
+	if got := logged("missing"); len(got) != 0 {
+		t.Errorf("missing blob logged: %v", got)
+	}
+	slow := logged("slow")
+	if len(slow) != 1 || slow[0]["firstByte"].Duration() < 100*time.Millisecond || slow[0]["requestID"].String() != "server-slow" ||
+		slow[0]["bodyBytes"].Int64() != 4 || slow[0]["attempt"].Int64() != 1 || slow[0]["clientRequestID"].String() == "" {
+		t.Errorf("slow request records = %v, want one with its first-byte time, request IDs and body size", slow)
+	}
+	flaky := logged("flaky")
+	if len(flaky) != 2 {
+		t.Fatalf("flaky request records = %v, want the failed attempt and its retry", flaky)
+	}
+	if flaky[0]["status"].Int64() != http.StatusServiceUnavailable || flaky[0]["level"].String() != "WARN" || flaky[0]["attempt"].Int64() != 1 ||
+		flaky[1]["status"].Int64() != http.StatusOK || flaky[1]["attempt"].Int64() != 2 ||
+		flaky[0]["clientRequestID"].String() != flaky[1]["clientRequestID"].String() {
+		t.Errorf("flaky request records = %v, want a warned 503 and a retry with the same client request ID", flaky)
+	}
+}
+
+type funcHandler func(slog.Record)
+
+func (h funcHandler) Enabled(context.Context, slog.Level) bool      { return true }
+func (h funcHandler) Handle(_ context.Context, r slog.Record) error { h(r); return nil }
+func (h funcHandler) WithAttrs([]slog.Attr) slog.Handler            { return h }
+func (h funcHandler) WithGroup(string) slog.Handler                 { return h }

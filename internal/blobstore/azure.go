@@ -73,8 +73,9 @@ func newTokenAzure(accountURL string, containers []string, credential azcore.Tok
 
 func clientOptions(endpoint *url.URL, base http.RoundTripper, retry policy.RetryOptions, stallTimeout time.Duration) *service.ClientOptions {
 	return &service.ClientOptions{ClientOptions: azcore.ClientOptions{
-		Transport: newEndpointTransport(endpoint, base, stallTimeout),
-		Retry:     retry,
+		Transport:       newEndpointTransport(endpoint, base, stallTimeout),
+		Retry:           retry,
+		PerCallPolicies: []policy.Policy{operationPolicy{}},
 	}}
 }
 
@@ -166,7 +167,7 @@ func (a *Azure) Download(ctx context.Context, name string) (Download, error) {
 		size = *resp.ContentLength
 	}
 	return Download{
-		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
+		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3, OnFailedRead: logFailedRead(ctx, name)})},
 		Size:     size,
 		Metadata: resp.Metadata,
 		ETag:     etagString(resp.ETag),
@@ -195,7 +196,7 @@ func (a *Azure) DownloadFirst(ctx context.Context, name string, count int64) (Do
 		return Download{}, err
 	}
 	return Download{
-		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})},
+		Body:     mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3, OnFailedRead: logFailedRead(ctx, name)})},
 		Size:     size,
 		Metadata: resp.Metadata,
 		ETag:     etagString(resp.ETag),
@@ -240,7 +241,7 @@ func (a *Azure) DownloadRange(ctx context.Context, name string, offset, count in
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3})}, nil
+	return mappedBody{resp.NewRetryReader(ctx, &blob.RetryReaderOptions{MaxRetries: 3, OnFailedRead: logFailedRead(ctx, name)})}, nil
 }
 
 // List returns every blob name under prefix.
