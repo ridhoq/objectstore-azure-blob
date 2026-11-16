@@ -29,25 +29,32 @@ import (
 	"time"
 )
 
-// defaultStallTimeout bounds how long a storage request may make no progress.
-// It bounds progress, not total time: a request of any size runs as long as
-// its bytes keep moving, and the timeout applies to each wait, such as for
-// Azure's answer after the last byte of a block or for the next bytes of a
-// download. It is short enough that a stalled endpoint fails an RPC with
-// Unavailable after the SDK's retries instead of holding its caller
-// indefinitely.
+// defaultStallTimeout bounds how long a storage request may make no progress
+// while it is sent and while it waits for Azure's answer, such as after the
+// last byte of a block. It bounds progress, not total time: a request of any
+// size runs as long as its bytes keep moving. It is short enough that a
+// stalled endpoint fails an RPC with Unavailable after the SDK's retries
+// instead of holding its caller indefinitely.
 const defaultStallTimeout = time.Minute
+
+// defaultBodyStallTimeout bounds one read of a response body that gets no
+// bytes. Azure has done its work by the time it starts a body, so a body that
+// stops is a failed transfer: in an AKS benchmark, Azure failed in-flight
+// downloads with InternalError without closing their connections, and each
+// waited out the full defaultStallTimeout before the SDK resumed it. A read
+// that waits this long is resumed with a new request.
+const defaultBodyStallTimeout = 15 * time.Second
 
 // endpointTransport sends requests only to the configured storage account
 // endpoint and never follows redirects. The SDK attaches the plugin's storage
 // credential to every request a client makes, so a request to any other
 // scheme or host would hand that credential to it.
 //
-// It also cancels a request that makes no progress for stallTimeout: while
-// it sends the request body, while it waits for the response headers after
-// the last body read, or during any one read of the response body. Time the
-// caller spends between response body reads does not count, so a slow
-// consumer of a long download is not cut off.
+// It also cancels a request that makes no progress for stallTimeout while it
+// sends the request body or waits for the response headers after the last
+// body read, or for bodyStallTimeout during any one read of the response
+// body. Time the caller spends between response body reads does not count, so
+// a slow consumer of a long download is not cut off.
 //
 // Once a request returns, its body reads fail: net/http may still be sending
 // the body of a request the server answered early, while the SDK's retry
@@ -57,6 +64,8 @@ type endpointTransport struct {
 	host         string
 	client       *http.Client
 	stallTimeout time.Duration
+	// bodyStallTimeout bounds one response body read.
+	bodyStallTimeout time.Duration
 	// slowRequest is how long an attempt may take before it is logged.
 	slowRequest time.Duration
 }
@@ -71,8 +80,9 @@ func newEndpointTransport(endpoint *url.URL, base http.RoundTripper, stallTimeou
 				return http.ErrUseLastResponse
 			},
 		},
-		stallTimeout: stallTimeout,
-		slowRequest:  defaultSlowRequest,
+		stallTimeout:     stallTimeout,
+		bodyStallTimeout: min(stallTimeout, defaultBodyStallTimeout),
+		slowRequest:      defaultSlowRequest,
 	}
 }
 
@@ -83,7 +93,7 @@ func (t *endpointTransport) Do(req *http.Request) (*http.Response, error) {
 	}
 	log := newAttemptLog(req, t.slowRequest)
 	ctx, cancel := context.WithCancel(httptrace.WithClientTrace(req.Context(), log.trace()))
-	watch := newStallWatch(t.stallTimeout, cancel)
+	watch := newStallWatch(t.stallTimeout, t.bodyStallTimeout, cancel)
 	fence := &bodyFence{}
 	defer fence.close()
 	out := req.WithContext(ctx)
@@ -117,11 +127,13 @@ func (t *endpointTransport) Do(req *http.Request) (*http.Response, error) {
 }
 
 // stallWatch cancels a request's context when its timer fires. The timer runs
-// from the start of the request until its response headers arrive, restarting
-// at each read of the request body, and then only during response body reads.
+// for timeout from the start of the request until its response headers
+// arrive, restarting at each read of the request body, and then for
+// readTimeout during each response body read.
 type stallWatch struct {
-	timeout time.Duration
-	cancel  context.CancelFunc
+	timeout     time.Duration
+	readTimeout time.Duration
+	cancel      context.CancelFunc
 
 	mu          sync.Mutex
 	timer       *time.Timer
@@ -129,8 +141,8 @@ type stallWatch struct {
 	stalled     bool
 }
 
-func newStallWatch(timeout time.Duration, cancel context.CancelFunc) *stallWatch {
-	w := &stallWatch{timeout: timeout, cancel: cancel}
+func newStallWatch(timeout, readTimeout time.Duration, cancel context.CancelFunc) *stallWatch {
+	w := &stallWatch{timeout: timeout, readTimeout: readTimeout, cancel: cancel}
 	w.timer = time.AfterFunc(timeout, w.fire)
 	return w
 }
@@ -163,7 +175,7 @@ func (w *stallWatch) responded() {
 func (w *stallWatch) startRead() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.timer.Reset(w.timeout)
+	w.timer.Reset(w.readTimeout)
 }
 
 func (w *stallWatch) endRead() {
@@ -229,7 +241,7 @@ func (b *responseBody) Read(p []byte) (int, error) {
 	if err != nil && err != io.EOF && b.watch.isStalled() {
 		// Returned unwrapped: the SDK's download retry reader resumes only
 		// after an error that is itself a net.Error.
-		return n, &stallError{timeout: b.watch.timeout}
+		return n, &stallError{timeout: b.watch.readTimeout}
 	}
 	return n, err
 }

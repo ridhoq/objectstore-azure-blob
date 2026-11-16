@@ -272,6 +272,61 @@ func TestStalledDownloadResumes(t *testing.T) {
 	}
 }
 
+// TestStalledBodyResumesBeforeTheResponseTimeout answers a download after
+// longer than the body timeout, then stops sending its body without closing
+// the connection, as Azure did when it failed in-flight downloads with
+// InternalError. The slow answer is not a stall; the stopped body is, after
+// the shorter body timeout, and the download resumes from where it stopped.
+func TestStalledBodyResumesBeforeTheResponseTimeout(t *testing.T) {
+	const (
+		data          = "snapshot bytes"
+		stallTimeout  = 2 * time.Second
+		bodyTimeout   = 200 * time.Millisecond
+		responseDelay = 500 * time.Millisecond
+	)
+	var requests atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		if requests.Add(1) > 1 {
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)-1))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 1-%d/%d", len(data)-1, len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, data[1:])
+			return
+		}
+		time.Sleep(responseDelay)
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, data[:1])
+		w.(http.Flusher).Flush()
+		stall(t, r)
+	}))
+	defer server.Close()
+	opts := clientOptions(mustParseURL(t, server.URL), server.Client().Transport, policy.RetryOptions{MaxRetries: -1}, stallTimeout)
+	opts.Transport.(*endpointTransport).bodyStallTimeout = bodyTimeout
+	client, err := service.NewClient(server.URL, staticCredential{}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	download, err := newAzure(client, "snapshots").Download(t.Context(), "prefix/file")
+	if err != nil {
+		t.Fatalf("Download answered after %s: %v", responseDelay, err)
+	}
+	defer download.Body.Close()
+	got, err := io.ReadAll(download.Body)
+	if err != nil || string(got) != data {
+		t.Fatalf("reading the body = %q, %v; want %q", got, err, data)
+	}
+	if n := requests.Load(); n != 2 {
+		t.Fatalf("server saw %d requests, want the stalled one and its resume", n)
+	}
+	if elapsed := time.Since(start); elapsed >= responseDelay+stallTimeout/2 {
+		t.Fatalf("download took %s: the stalled body waited for the %s response timeout, not the %s body timeout", elapsed, stallTimeout, bodyTimeout)
+	}
+}
+
 // TestSlowDownloadConsumerIsNotStalled pauses between reads of a download for
 // longer than the stall timeout: only time spent waiting on the endpoint counts.
 func TestSlowDownloadConsumerIsNotStalled(t *testing.T) {
@@ -428,14 +483,16 @@ func TestRequestLog(t *testing.T) {
 				return
 			}
 		case "/snapshots/slow":
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 		}
 		w.Header().Set("Content-Length", "4")
 		_, _ = w.Write([]byte("data"))
 	}))
 	defer server.Close()
 	opts := clientOptions(mustParseURL(t, server.URL), server.Client().Transport, policy.RetryOptions{RetryDelay: time.Millisecond}, defaultStallTimeout)
-	opts.Transport.(*endpointTransport).slowRequest = 50 * time.Millisecond
+	// Far above a fast answer from a local server, even on a loaded machine,
+	// and far below the slow one.
+	opts.Transport.(*endpointTransport).slowRequest = 250 * time.Millisecond
 	client, err := service.NewClient(server.URL, staticCredential{}, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -486,7 +543,7 @@ func TestRequestLog(t *testing.T) {
 		t.Errorf("missing blob logged: %v", got)
 	}
 	slow := logged("slow")
-	if len(slow) != 1 || slow[0]["firstByte"].Duration() < 100*time.Millisecond || slow[0]["requestID"].String() != "server-slow" ||
+	if len(slow) != 1 || slow[0]["firstByte"].Duration() < 500*time.Millisecond || slow[0]["requestID"].String() != "server-slow" ||
 		slow[0]["bodyBytes"].Int64() != 4 || slow[0]["attempt"].Int64() != 1 || slow[0]["clientRequestID"].String() == "" {
 		t.Errorf("slow request records = %v, want one with its first-byte time, request IDs and body size", slow)
 	}

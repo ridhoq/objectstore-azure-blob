@@ -355,7 +355,7 @@ caller's own logs. It also logs:
 | Azure Storage returns HTTP 401 or 403 | `PermissionDenied` |
 | Azure throttling, timeout, or server failure | `Unavailable` |
 | Connection failure, DNS server failure, or DNS timeout after the SDK's retries, or a download that fails after resuming | `Unavailable` |
-| Storage request that makes no progress for one minute (sending, awaiting the response, or one body read), after the SDK's retries | `Unavailable` |
+| Storage request that makes no progress for one minute while sending or awaiting the response, or for 15 seconds during one read of the response body, after the SDK's retries and download resumes | `Unavailable` |
 | Unknown storage account host name | `Internal` |
 | Microsoft Entra token request throttled, timed out, failed with a server error, or got no response | `Unavailable` |
 | Microsoft Entra rejects the token request | `Internal` |
